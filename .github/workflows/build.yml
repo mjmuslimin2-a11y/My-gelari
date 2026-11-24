@@ -1,0 +1,627 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/res/xml app/src/main/java/com/myvault/app
+          cat > settings.gradle.kts <<'VAULT_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MyVault"
+          include(":app")
+          VAULT_EOF
+          cat > build.gradle.kts <<'VAULT_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          VAULT_EOF
+          cat > gradle.properties <<'VAULT_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          VAULT_EOF
+          cat > app/build.gradle.kts <<'VAULT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.myvault.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.myvault.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.6.1")
+              implementation("androidx.biometric:biometric:1.1.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          VAULT_EOF
+          cat > app/src/main/AndroidManifest.xml <<'VAULT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:label="আমার ভল্ট"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="com.myvault.app.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          VAULT_EOF
+          cat > app/src/main/res/xml/file_paths.xml <<'VAULT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="view" path="view/" />
+          </paths>
+          VAULT_EOF
+          cat > app/src/main/java/com/myvault/app/Crypto.kt <<'VAULT_EOF'
+          package com.myvault.app
+
+          import java.io.IOException
+          import java.io.InputStream
+          import java.io.OutputStream
+          import java.nio.ByteBuffer
+          import java.security.SecureRandom
+          import javax.crypto.Cipher
+          import javax.crypto.SecretKey
+          import javax.crypto.SecretKeyFactory
+          import javax.crypto.spec.GCMParameterSpec
+          import javax.crypto.spec.PBEKeySpec
+          import javax.crypto.spec.SecretKeySpec
+
+          object Crypto {
+              private const val ITER = 310_000
+              private const val CHUNK = 1 shl 20
+              private val sr = SecureRandom()
+
+              fun rnd(n: Int) = ByteArray(n).also { sr.nextBytes(it) }
+
+              fun key(pw: CharArray, salt: ByteArray): SecretKey {
+                  val spec = PBEKeySpec(pw, salt, ITER, 256)
+                  try {
+                      val raw = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+                      return SecretKeySpec(raw, "AES")
+                  } finally { spec.clearPassword() }
+              }
+
+              private fun cipher(mode: Int, k: SecretKey, iv: ByteArray) =
+                  Cipher.getInstance("AES/GCM/NoPadding").apply { init(mode, k, GCMParameterSpec(128, iv)) }
+
+              fun seal(k: SecretKey, d: ByteArray): ByteArray {
+                  val iv = rnd(12)
+                  return iv + cipher(Cipher.ENCRYPT_MODE, k, iv).doFinal(d)
+              }
+
+              fun open(k: SecretKey, b: ByteArray): ByteArray =
+                  cipher(Cipher.DECRYPT_MODE, k, b.copyOf(12)).doFinal(b, 12, b.size - 12)
+
+              fun readFully(i: InputStream, b: ByteArray, len: Int = b.size): Int {
+                  var n = 0
+                  while (n < len) {
+                      val r = i.read(b, n, len - n)
+                      if (r < 0) break
+                      n += r
+                  }
+                  return n
+              }
+
+              private fun iv(p: ByteArray, c: Int) = p + ByteBuffer.allocate(4).putInt(c).array()
+              private fun aad(c: Int, last: Boolean) =
+                  ByteBuffer.allocate(5).putInt(c).put((if (last) 1 else 0).toByte()).array()
+
+              // বড় ভিডিওর জন্য ১ MB করে টুকরো টুকরো এনক্রিপশন
+              fun enc(k: SecretKey, inp: InputStream, out: OutputStream) {
+                  val p = rnd(8)
+                  out.write(p)
+                  val buf = ByteArray(CHUNK)
+                  var c = 0
+                  while (true) {
+                      val n = readFully(inp, buf)
+                      if (n == 0) break
+                      chunk(k, p, c++, buf, n, false, out)
+                  }
+                  chunk(k, p, c, buf, 0, true, out)
+              }
+
+              private fun chunk(k: SecretKey, p: ByteArray, c: Int, buf: ByteArray, n: Int, last: Boolean, out: OutputStream) {
+                  val ci = cipher(Cipher.ENCRYPT_MODE, k, iv(p, c))
+                  ci.updateAAD(aad(c, last))
+                  val ct = ci.doFinal(buf, 0, n)
+                  out.write(ByteBuffer.allocate(4).putInt(ct.size or (if (last) Int.MIN_VALUE else 0)).array())
+                  out.write(ct)
+              }
+
+              fun dec(k: SecretKey, inp: InputStream, out: OutputStream) {
+                  val p = ByteArray(8)
+                  if (readFully(inp, p) != 8) throw IOException("bad")
+                  var c = 0
+                  val h = ByteArray(4)
+                  while (true) {
+                      if (readFully(inp, h) != 4) throw IOException("truncated")
+                      val v = ByteBuffer.wrap(h).int
+                      val last = v < 0
+                      val len = v and Int.MAX_VALUE
+                      if (len < 16 || len > CHUNK + 16) throw IOException("bad")
+                      val ct = ByteArray(len)
+                      if (readFully(inp, ct) != len) throw IOException("truncated")
+                      val ci = cipher(Cipher.DECRYPT_MODE, k, iv(p, c))
+                      ci.updateAAD(aad(c, last))
+                      out.write(ci.doFinal(ct))
+                      if (last) break
+                      c++
+                  }
+              }
+          }
+          VAULT_EOF
+          cat > app/src/main/java/com/myvault/app/MainActivity.kt <<'VAULT_EOF'
+          package com.myvault.app
+
+          import android.content.ContentValues
+          import android.content.DialogInterface
+          import android.content.Intent
+          import android.os.Environment
+          import android.provider.MediaStore
+          import androidx.core.content.FileProvider
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.OpenableColumns
+          import android.net.Uri
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.*
+          import androidx.activity.OnBackPressedCallback
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.biometric.BiometricManager
+          import androidx.biometric.BiometricPrompt
+          import androidx.core.content.ContextCompat
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.BufferedOutputStream
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.UUID
+          import javax.crypto.SecretKey
+
+          class MainActivity : AppCompatActivity() {
+              data class Item(val id: String, val name: String, val type: String, val added: Long)
+
+              private lateinit var root: FrameLayout
+              private var masterKey: SecretKey? = null
+              private val items = mutableListOf<Item>()
+              private var picking = false
+              private var busy = 0
+              private var viewer: View? = null
+              private var dlg: AlertDialog? = null
+              private val vaultDir by lazy { File(filesDir, "vault").also { it.mkdirs() } }
+              private val viewDir by lazy { File(cacheDir, "view").also { it.mkdirs() } }
+              private val masterFile by lazy { File(filesDir, "master.bin") }
+              private val indexFile by lazy { File(filesDir, "index.bin") }
+
+              private val picker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                  picking = false
+                  if (masterKey != null && uris.isNotEmpty()) addNext(uris, 0)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+                  root = FrameLayout(this)
+                  setContentView(root)
+                  onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                      override fun handleOnBackPressed() { if (viewer != null) closeViewer() else finish() }
+                  })
+                  wipeCache()
+                  if (masterFile.exists()) showLock() else showSetup()
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  if (!picking && busy == 0 && masterKey != null) lock()
+              }
+
+              // ---------- helpers ----------
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+              private fun wipeCache() { viewDir.listFiles()?.forEach { it.delete() } }
+
+              private fun tv(t: String, size: Float = 16f, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = size; setPadding(0, dp(6), 0, dp(6))
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+              }
+              private fun pwField(h: String) = EditText(this).apply {
+                  hint = h
+                  inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+              }
+              private fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
+
+              private fun screen(vararg views: View) {
+                  closeViewer()
+                  root.removeAllViews()
+                  val l = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(40), dp(20), dp(20))
+                  }
+                  views.forEach { l.addView(it) }
+                  root.addView(ScrollView(this).apply { addView(l) })
+              }
+
+              private fun <T> bg(job: () -> T, done: (Result<T>) -> Unit) {
+                  busy++
+                  Thread {
+                      val r = runCatching(job)
+                      runOnUiThread { busy--; done(r) }
+                  }.start()
+              }
+
+              // ---------- আনলক ধাপ ----------
+              private fun showSetup() {
+                  val p1 = pwField("মাস্টার পাসওয়ার্ড (কমপক্ষে ১০ অক্ষর)")
+                  val p2 = pwField("আবার লিখুন")
+                  val st = tv("")
+                  screen(
+                      tv("আমার ভল্ট", 26f, true),
+                      tv("প্রথমবার: মাস্টার পাসওয়ার্ড তৈরি করুন। ভুলে গেলে কিছুই উদ্ধার করা যাবে না।"),
+                      p1, p2, st,
+                      btn("তৈরি করুন") {
+                          val a = p1.text.toString().toCharArray()
+                          if (a.size < 10) { st.text = "কমপক্ষে ১০ অক্ষর দিন।"; return@btn }
+                          if (!a.contentEquals(p2.text.toString().toCharArray())) { st.text = "দুটি মেলেনি।"; return@btn }
+                          st.text = "অপেক্ষা করুন…"
+                          bg({
+                              val salt = Crypto.rnd(16)
+                              val k = Crypto.key(a, salt)
+                              masterFile.writeBytes(salt + Crypto.seal(k, "ok".toByteArray()))
+                              k
+                          }) { r ->
+                              a.fill('0')
+                              r.onSuccess { masterKey = it; items.clear(); saveIndex(); showHome() }
+                                  .onFailure { st.text = "ব্যর্থ হয়েছে।" }
+                          }
+                      }
+                  )
+              }
+
+              private fun showLock() {
+                  val st = tv("")
+                  fun go() = askBiometric(st) { showPassword() }
+                  screen(
+                      tv("আমার ভল্ট", 26f, true),
+                      tv("ধাপ ১: ফিঙ্গারপ্রিন্ট / ফেস / স্ক্রিন লক\nধাপ ২: মাস্টার পাসওয়ার্ড\nধাপ ৩: প্রতিটি ফাইলের নিজস্ব পাসওয়ার্ড"),
+                      st,
+                      btn("আনলক করুন") { go() }
+                  )
+                  root.post { go() }
+              }
+
+              private fun askBiometric(st: TextView, ok: () -> Unit) {
+                  val auth = BiometricManager.Authenticators.BIOMETRIC_WEAK or BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                  val can = BiometricManager.from(this).canAuthenticate(auth)
+                  if (can != BiometricManager.BIOMETRIC_SUCCESS) {
+                      st.text = "ফোনে স্ক্রিন লক (পিন/প্যাটার্ন/পাসওয়ার্ড) বা ফিঙ্গারপ্রিন্ট/ফেস সেট করা নেই। ফোনের Settings থেকে সেট করুন।"
+                      return
+                  }
+                  val prompt = BiometricPrompt(this, ContextCompat.getMainExecutor(this),
+                      object : BiometricPrompt.AuthenticationCallback() {
+                          override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) { ok() }
+                          override fun onAuthenticationError(errorCode: Int, errString: CharSequence) { st.text = errString }
+                      })
+                  prompt.authenticate(
+                      BiometricPrompt.PromptInfo.Builder()
+                          .setTitle("ভল্ট আনলক")
+                          .setAllowedAuthenticators(auth)
+                          .build()
+                  )
+              }
+
+              private fun showPassword() {
+                  val p = pwField("মাস্টার পাসওয়ার্ড")
+                  val st = tv("")
+                  screen(
+                      tv("আমার ভল্ট", 26f, true), tv("ধাপ ২: মাস্টার পাসওয়ার্ড দিন"), p, st,
+                      btn("খুলুন") {
+                          val a = p.text.toString().toCharArray()
+                          p.setText("")
+                          st.text = "অপেক্ষা করুন…"
+                          bg({
+                              val b = masterFile.readBytes()
+                              val k = Crypto.key(a, b.copyOf(16))
+                              if (String(Crypto.open(k, b.copyOfRange(16, b.size))) != "ok") error("x")
+                              k
+                          }) { r ->
+                              a.fill('0')
+                              r.onSuccess { masterKey = it; loadIndex(); showHome() }
+                                  .onFailure { st.text = "পাসওয়ার্ড ভুল।" }
+                          }
+                      }
+                  )
+              }
+
+              private fun lock() {
+                  dlg?.dismiss(); dlg = null
+                  masterKey = null
+                  items.clear()
+                  closeViewer()
+                  showLock()
+              }
+
+              // ---------- ইনডেক্স (নাম/ধরন, মাস্টার কী দিয়ে এনক্রিপ্টেড) ----------
+              private fun loadIndex() {
+                  items.clear()
+                  if (!indexFile.exists()) return
+                  val arr = JSONArray(String(Crypto.open(masterKey!!, indexFile.readBytes())))
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      items.add(Item(o.getString("id"), o.getString("name"), o.getString("type"), o.getLong("added")))
+                  }
+              }
+
+              private fun saveIndex() {
+                  val arr = JSONArray()
+                  items.forEach {
+                      arr.put(JSONObject().put("id", it.id).put("name", it.name).put("type", it.type).put("added", it.added))
+                  }
+                  indexFile.writeBytes(Crypto.seal(masterKey!!, arr.toString().toByteArray()))
+              }
+
+              // ---------- হোম ----------
+              private fun showHome() {
+                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  if (items.isEmpty()) list.addView(tv("এখনো কিছু নেই।"))
+                  items.sortedByDescending { it.added }.forEach { item ->
+                      val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                      val name = tv((if (item.type.startsWith("video/")) "🎬 " else "🖼 ") + item.name).apply {
+                          setPadding(0, dp(14), 0, dp(14))
+                          setOnClickListener { openItem(item) }
+                      }
+                      row.addView(name, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      row.addView(btn("মুছুন") { confirmDelete(item) })
+                      list.addView(row)
+                  }
+                  val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  head.addView(tv("আমার ভল্ট", 24f, true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  head.addView(btn("লক") { lock() })
+                  screen(head, btn("+ ছবি/ভিডিও যোগ করুন") {
+                      picking = true
+                      picker.launch(arrayOf("image/*", "video/*"))
+                  }, list)
+              }
+
+              private fun confirmDelete(item: Item) {
+                  dlg = AlertDialog.Builder(this).setTitle("মুছবেন?")
+                      .setMessage(item.name + " চিরতরে মুছে যাবে।")
+                      .setPositiveButton("মুছুন") { _, _ ->
+                          File(vaultDir, item.id + ".enc").delete()
+                          items.remove(item); saveIndex(); showHome()
+                      }.setNegativeButton("না", null).show()
+              }
+
+              // ---------- পাসওয়ার্ড ডায়ালগ ----------
+              private fun askPassword(title: String, confirm: Boolean, ok: (CharArray) -> Unit, cancel: () -> Unit = {}) {
+                  val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
+                  val a = pwField("পাসওয়ার্ড")
+                  val b = pwField("আবার লিখুন")
+                  val st = TextView(this)
+                  l.addView(a); if (confirm) l.addView(b); l.addView(st)
+                  val d = AlertDialog.Builder(this).setTitle(title).setView(l).setCancelable(false)
+                      .setPositiveButton("ঠিক আছে", null)
+                      .setNegativeButton("বাতিল") { _, _ -> cancel() }.create()
+                  d.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                  d.setOnShowListener {
+                      d.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                          val x = a.text.toString()
+                          if (confirm) {
+                              if (x.length < 6) { st.text = "কমপক্ষে ৬ অক্ষর দিন।"; return@setOnClickListener }
+                              if (x != b.text.toString()) { st.text = "দুটি মেলেনি।"; return@setOnClickListener }
+                          } else if (x.isEmpty()) return@setOnClickListener
+                          d.dismiss(); dlg = null
+                          ok(x.toCharArray())
+                      }
+                  }
+                  dlg = d
+                  d.show()
+              }
+
+              // ---------- ফাইল যোগ (প্রতিটির আলাদা পাসওয়ার্ড) ----------
+              private fun displayName(uri: Uri): String {
+                  contentResolver.query(uri, null, null, null, null)?.use {
+                      if (it.moveToFirst()) {
+                          val i = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                          if (i >= 0) return it.getString(i)
+                      }
+                  }
+                  return uri.lastPathSegment ?: "file"
+              }
+
+              private fun addNext(uris: List<Uri>, i: Int) {
+                  if (i >= uris.size) { showHome(); return }
+                  val uri = uris[i]
+                  val name = displayName(uri)
+                  askPassword("এই ফাইলের পাসওয়ার্ড: $name", true,
+                      { pw -> encryptFile(uri, name, pw) { addNext(uris, i + 1) } },
+                      { addNext(uris, i + 1) })
+              }
+
+              private fun encryptFile(uri: Uri, name: String, pw: CharArray, next: () -> Unit) {
+                  val type = contentResolver.getType(uri) ?: "application/octet-stream"
+                  val id = UUID.randomUUID().toString()
+                  val f = File(vaultDir, "$id.enc")
+                  bg({
+                      val salt = Crypto.rnd(16)
+                      val k = Crypto.key(pw, salt)
+                      contentResolver.openInputStream(uri)!!.use { inp ->
+                          FileOutputStream(f).use { fo ->
+                              val out = BufferedOutputStream(fo)
+                              out.write(salt)
+                              Crypto.enc(k, inp, out)
+                              out.flush()
+                          }
+                      }
+                  }) { r ->
+                      pw.fill('0')
+                      r.onSuccess {
+                          items.add(Item(id, name, type, System.currentTimeMillis()))
+                          saveIndex()
+                          toast("সংরক্ষিত: $name")
+                      }.onFailure { f.delete(); toast("ব্যর্থ: $name") }
+                      next()
+                  }
+              }
+
+              // ---------- ফাইল খোলা ----------
+              private fun openItem(item: Item) {
+                  askPassword("পাসওয়ার্ড: ${item.name}", false, { pw ->
+                      val ext = item.type.substringAfter('/', "bin").ifEmpty { "bin" }
+                      val outF = File(viewDir, "${item.id}.$ext")
+                      bg({
+                          File(vaultDir, "${item.id}.enc").inputStream().buffered().use { inp ->
+                              val salt = ByteArray(16)
+                              if (Crypto.readFully(inp, salt) != 16) error("bad")
+                              val k = Crypto.key(pw, salt)
+                              FileOutputStream(outF).use { Crypto.dec(k, inp, it) }
+                          }
+                      }) { r ->
+                          pw.fill('0')
+                          r.onSuccess { showViewer(outF, item) }
+                              .onFailure { outF.delete(); toast("পাসওয়ার্ড ভুল।") }
+                      }
+                  })
+              }
+
+              private fun showViewer(f: File, item: Item) {
+                  viewer?.let { root.removeView(it) }
+                  viewer = null
+                  val frame = FrameLayout(this).apply { setBackgroundColor(Color.BLACK); isClickable = true }
+                  val full = FrameLayout.LayoutParams(-1, -1, Gravity.CENTER)
+                  if (item.type.startsWith("video/")) {
+                      val v = VideoView(this)
+                      v.setVideoPath(f.path)
+                      v.setMediaController(MediaController(this).also { it.setAnchorView(v) })
+                      v.setOnPreparedListener { v.start() }
+                      frame.addView(v, full)
+                  } else {
+                      val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                      BitmapFactory.decodeFile(f.path, o)
+                      var s = 1
+                      while (o.outWidth / s > 2048 || o.outHeight / s > 2048) s *= 2
+                      val bmp = BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = s })
+                      frame.addView(ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setImageBitmap(bmp) }, full)
+                  }
+                  val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
+                  bar.addView(btn("বন্ধ") { closeViewer() })
+                  bar.addView(btn("গ্যালারিতে সেভ") {
+                      confirmExport("ফাইলটি এনক্রিপশনের বাইরে গ্যালারিতে চলে যাবে। সেভ করবেন?") { saveToGallery(f, item) }
+                  })
+                  bar.addView(btn("শেয়ার") {
+                      confirmExport("ফাইলটির একটি এনক্রিপশন-ছাড়া কপি অন্য অ্যাপে যাবে। পাঠাবেন?") { shareFile(f, item) }
+                  })
+                  frame.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(30) })
+                  root.addView(frame)
+                  viewer = frame
+              }
+
+              private fun confirmExport(msg: String, go: () -> Unit) {
+                  dlg = AlertDialog.Builder(this).setTitle("নিশ্চিত?").setMessage(msg)
+                      .setPositiveButton("হ্যাঁ") { _, _ -> go() }
+                      .setNegativeButton("না", null).show()
+              }
+
+              private fun saveToGallery(f: File, item: Item) {
+                  val video = item.type.startsWith("video/")
+                  val cv = ContentValues().apply {
+                      put(MediaStore.MediaColumns.DISPLAY_NAME, item.name)
+                      put(MediaStore.MediaColumns.MIME_TYPE, item.type)
+                      put(MediaStore.MediaColumns.RELATIVE_PATH,
+                          (if (video) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES) + "/MyVault")
+                      put(MediaStore.MediaColumns.IS_PENDING, 1)
+                  }
+                  val col = if (video) MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                            else MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                  toast("সেভ হচ্ছে…")
+                  bg({
+                      val u = contentResolver.insert(col, cv)!!
+                      contentResolver.openOutputStream(u)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+                      val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                      contentResolver.update(u, done, null, null)
+                  }) { r ->
+                      r.onSuccess { toast("গ্যালারিতে সেভ হয়েছে (MyVault ফোল্ডার)") }
+                          .onFailure { toast("সেভ করা যায়নি।") }
+                  }
+              }
+
+              private fun shareFile(f: File, item: Item) {
+                  val uri = FileProvider.getUriForFile(this, "com.myvault.app.fileprovider", f)
+                  val i = Intent(Intent.ACTION_SEND).apply {
+                      type = item.type
+                      putExtra(Intent.EXTRA_STREAM, uri)
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  }
+                  picking = true
+                  startActivity(Intent.createChooser(i, "পাঠান"))
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  picking = false
+              }
+
+              private fun closeViewer() {
+                  viewer?.let { root.removeView(it) }
+                  viewer = null
+                  wipeCache()
+              }
+          }
+          VAULT_EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyVault-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
